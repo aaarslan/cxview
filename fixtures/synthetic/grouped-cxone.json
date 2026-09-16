@@ -1,0 +1,80 @@
+{
+  "format": "synthetic-cxone-grouped",
+  "fixtureRevision": 1,
+  "projectId": "fixture-react",
+  "projectName": "react-remediation-fixture",
+  "scanId": "scan-grouped-001",
+  "branch": "main",
+  "commit": "fixture-commit-before",
+  "timestamp": "2026-09-16T12:00:00Z",
+  "completeness": "complete",
+  "filters": { "severity": ["High", "Medium"] },
+  "engines": ["SAST", "SCA", "IaC"],
+  "scanResults": [
+    {
+      "queryId": "CXSAST-RAW-HTML",
+      "queryName": "Untrusted data in raw HTML",
+      "severity": "High",
+      "total": 1,
+      "results": [
+        {
+          "id": "sast-fixture-001",
+          "resultStatus": "To Verify",
+          "triageState": "Not Reviewed",
+          "filePath": "src/App.tsx",
+          "line": 5,
+          "lineEnd": 5,
+          "description": "Untrusted content reaches a raw HTML rendering sink.",
+          "recommendation": "Determine whether rich HTML is required before choosing a context-appropriate repair.",
+          "cwe": "CWE-79",
+          "snippet": "dangerouslySetInnerHTML={{__html: value}}",
+          "nodes": [
+            { "fileName": "src/App.tsx", "line": 3, "role": "source", "sourceSink": "source", "snippet": "value" },
+            { "fileName": "src/App.tsx", "line": 5, "role": "sink", "sourceSink": "sink", "snippet": "dangerouslySetInnerHTML={{__html: value}}" }
+          ],
+          "evidenceLinks": ["https://example.invalid/fixture/sast-fixture-001"]
+        }
+      ]
+    }
+  ],
+  "scaScanResults": [
+    {
+      "queryId": "CXSCA-LODASH",
+      "severity": "Medium",
+      "total": 1,
+      "results": [
+        {
+          "id": "sca-fixture-001",
+          "packageName": "lodash",
+          "packageVersion": "4.17.20",
+          "ecosystem": "npm",
+          "affectedVersions": "<4.17.21",
+          "fixedVersions": ">=4.17.21",
+          "aliases": ["CVE-2021-23337"],
+          "dependencyPaths": ["fixture-app > direct-package > lodash"],
+          "reachability": "unknown",
+          "description": "A vulnerable package version is present in the scan evidence."
+        }
+      ]
+    }
+  ],
+  "iacScanResults": [
+    {
+      "queryId": "CXIAC-PUBLIC-BUCKET",
+      "severity": "Low",
+      "results": [
+        {
+          "id": "iac-fixture-001",
+          "resource": "aws_s3_bucket.assets",
+          "rule": "PUBLIC_BUCKET",
+          "provider": "aws",
+          "expectedValue": "private",
+          "actualValue": "public",
+          "context": "fixtures/storage.tf"
+        }
+      ]
+    }
+  ],
+  "unsupportedBranch": [{ "kind": "future-scanner", "value": "preserved as unsupported" }],
+  "declaredTotal": 99
+}

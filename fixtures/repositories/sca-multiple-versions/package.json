@@ -1,0 +1,10 @@
+{
+  "name": "cxview-sca-multiple-versions-fixture",
+  "private": true,
+  "dependencies": {
+    "direct-package": "1.0.0"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

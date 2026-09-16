@@ -1,0 +1,35 @@
+{
+  "format": "synthetic-cxone-results",
+  "projectId": "fixture-result-oriented",
+  "scanId": "scan-results-001",
+  "branch": "feature/evidence",
+  "completeness": "complete",
+  "results": [
+    {
+      "id": "result-sast-001",
+      "engine": "SAST",
+      "rule": "CXSAST-REDIRECT",
+      "severity": "Informational",
+      "filePath": "src/redirect.ts",
+      "line": 12,
+      "snippet": "res.redirect(next)",
+      "description": "A redirect destination is derived from request input."
+    },
+    {
+      "id": "result-sca-001",
+      "engine": "SCA",
+      "packageName": "express",
+      "packageVersion": "4.18.1",
+      "severity": "Low",
+      "affectedRange": "<4.18.2"
+    },
+    {
+      "id": "result-unknown-001",
+      "engine": "future-engine",
+      "severity": "new-severity-name",
+      "filePath": "src/future.ts",
+      "line": 2
+    }
+  ],
+  "unsupported": [{ "resultType": "query-group-total", "total": 7 }]
+}
