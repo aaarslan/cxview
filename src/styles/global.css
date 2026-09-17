@@ -1,16 +1,52 @@
 :root {
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --page-bg: #302f2c;
+  --page-text: #efede3;
+  --placeholder: #a39e93;
+  --scrollbar-thumb: #5b5850;
+  --scrollbar-thumb-hover: #756f64;
+  --selection-bg: rgba(227, 170, 99, .35);
+  font-family: "Avenir Next", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
   color-scheme: dark;
-  background: #0a0f18;
+  background: var(--page-bg);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
 
+:root[data-theme="light"] {
+  --page-bg: #efede3;
+  --page-text: #302f2c;
+  --placeholder: #6f6a60;
+  --scrollbar-thumb: #b1ab9d;
+  --scrollbar-thumb-hover: #8f897d;
+  --selection-bg: rgba(165, 84, 48, .22);
+  color-scheme: light;
+}
+
 * { box-sizing: border-box; }
-html, body, #root { width: 100%; min-width: 1100px; height: 100%; margin: 0; }
-body { overflow: hidden; background: #0a0f18; }
+html, body, #root { width: 100%; min-width: 0; height: 100%; margin: 0; }
+html { overflow-x: hidden; background: var(--page-bg); }
+body { overflow: auto; background: var(--page-bg); color: var(--page-text); }
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .45; }
 a { color: inherit; }
-::selection { background: rgba(91, 146, 255, .35); }
+::selection { background: var(--selection-bg); }
+
+input::placeholder,
+textarea::placeholder { color: var(--placeholder); opacity: 1; }
+
+code, pre { font-variant-ligatures: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { border: 3px solid transparent; border-radius: 999px; background: var(--scrollbar-thumb); background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); background-clip: padding-box; }

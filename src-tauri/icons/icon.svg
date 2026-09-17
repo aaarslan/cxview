@@ -1,11 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>CXView</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#29477f"/>
-      <stop offset="1" stop-color="#101a31"/>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b86b40"/>
+      <stop offset="1" stop-color="#6d3c2c"/>
     </linearGradient>
   </defs>
-  <rect width="1024" height="1024" rx="220" fill="url(#bg)"/>
-  <path d="M270 260h484v112H386v120h296v105H386v167H270z" fill="#e8f0ff"/>
-  <path d="M596 260h158v504H596z" fill="#7bd8d0" opacity=".9"/>
+  <rect width="1024" height="1024" rx="236" fill="#302f2c"/>
+  <rect x="44" y="44" width="936" height="936" rx="204" fill="url(#brand)" stroke="#e3aa63" stroke-width="12"/>
+  <path d="M526 304c-64-34-144-28-196 24-85 85-85 283 0 368 52 52 132 58 196 24" fill="none" stroke="#fff8ec" stroke-width="92" stroke-linecap="round"/>
+  <path d="M622 304 842 720M842 304 622 720" fill="none" stroke="#f1c27d" stroke-width="92" stroke-linecap="round"/>
 </svg>

@@ -2,6 +2,8 @@
 
 These are non-sensitive synthetic fixtures created for this repository because the implementation handoff did not include a user export. They are deliberately labeled synthetic and do not claim to be the user's exact Checkmarx One schema.
 
+For a hands-on import → bind → review → apply → validate demo, see [`docs/WALKTHROUGH.md`](../docs/WALKTHROUGH.md).
+
 | Fixture | Adapter branch | Covered evidence | Purpose |
 | --- | --- | --- | --- |
 | `synthetic/grouped-cxone.json` | `cxone-grouped` | SAST with two ordered nodes, SCA advisory fields, IaC resource/rule, a mismatched declared total, and an unsupported top-level branch | Grouped compatibility and evidence-preservation tests |

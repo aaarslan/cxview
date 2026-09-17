@@ -23,6 +23,8 @@ describe("desktop workbench entry", () => {
     await act(async () => { root?.render(<App />); await new Promise((resolve) => setTimeout(resolve, 25)); });
     expect(container.textContent).toContain("Evidence before edits.");
     expect(container.textContent).toContain("Open report");
+    expect(container.textContent).toContain("Browser preview");
+    expect(container.textContent).not.toContain("native commands are unavailable");
     expect(container.textContent).not.toContain("severity dashboard");
   });
 });
