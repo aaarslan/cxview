@@ -1,6 +1,6 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import type { AppSnapshot, AppliedPatch, ComparisonSummary, FindingSummary, ImportResult, InvestigationBundle, PatchReview, Profile, ProviderDiagnostic, RawInspection, RemediationTask, RepositoryContext, ReportSummary, StorageInfo, UiState, ValidationCandidate, ValidationRun } from "./types";
+import type { AppSnapshot, AppliedPatch, ComparisonSummary, FindingSummary, ImportResult, InvestigationBundle, ManualProposalInput, PatchReview, Profile, ProviderDiagnostic, RawInspection, RemediationTask, RepositoryContext, ReportSummary, StorageInfo, UiState, ValidationCandidate, ValidationRun } from "./types";
 
 export const isNative = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -41,7 +41,7 @@ export async function readRawLocator(reportId: string, locator: string): Promise
 export async function investigation(findingId: string): Promise<InvestigationBundle> { return invoke<InvestigationBundle>("get_investigation", { findingId }); }
 export async function createTask(findingId: string): Promise<RemediationTask> { return invoke<RemediationTask>("create_task", { findingId }); }
 export async function getTask(taskId: string): Promise<RemediationTask> { return invoke<RemediationTask>("get_task", { taskId }); }
-export async function createManualProposal(taskId: string, input: unknown): Promise<PatchReview> { return invoke<PatchReview>("create_manual_proposal", { taskId, input }); }
+export async function createManualProposal(taskId: string, input: ManualProposalInput): Promise<PatchReview> { return invoke<PatchReview>("create_manual_proposal", { taskId, input }); }
 export async function importProposal(taskId: string, path: string): Promise<PatchReview> { return invoke<PatchReview>("import_proposal", { taskId, path }); }
 export async function reviewPatch(taskId: string): Promise<PatchReview> { return invoke<PatchReview>("review_patch", { taskId }); }
 export async function applyReviewedPatch(request: { taskId: string; patchId: string; reviewed: boolean }): Promise<AppliedPatch> { return invoke<AppliedPatch>("apply_reviewed_patch", { request }); }

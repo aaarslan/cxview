@@ -173,6 +173,7 @@ pub fn resolve_finding_path(
             absolute: None,
             relative: None,
             reason: "The finding has no file path evidence.".to_owned(),
+            snippet_evidence: false,
         });
     };
     let normalized = normalize_report_path(report_path);
@@ -239,6 +240,7 @@ pub fn resolve_finding_path(
             } else {
                 "The report path resolves exactly inside the selected repository.".to_owned()
             },
+            snippet_evidence: false,
         });
     }
     let filename = Path::new(&relative)
@@ -252,6 +254,7 @@ pub fn resolve_finding_path(
             absolute: None,
             relative: None,
             reason: "The report path has no usable filename.".to_owned(),
+            snippet_evidence: false,
         });
     }
     let snippet = reported_snippet
@@ -293,7 +296,17 @@ pub fn resolve_finding_path(
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            Ok(ResolvedPath { state: MatchState::RelocatedWithEvidence, absolute: Some(path), relative: Some(relative), reason: "The original path was unavailable; a unique filename plus reported snippet match supports this relocation.".to_owned() })
+            Ok(ResolvedPath {
+                state: MatchState::RelocatedWithEvidence,
+                absolute: Some(path),
+                relative: Some(relative),
+                reason: if snippet.is_some() {
+                    "The original path was unavailable; a unique filename plus reported snippet match supports this relocation.".to_owned()
+                } else {
+                    "The original path was unavailable and the report supplied no snippet; this relocation rests on a single filename match, which is evidence but not edit authority.".to_owned()
+                },
+                snippet_evidence: snippet.is_some(),
+            })
         }
         count if count > 1 => Ok(ResolvedPath {
             state: MatchState::Ambiguous,
@@ -301,6 +314,7 @@ pub fn resolve_finding_path(
             relative: None,
             reason: "More than one candidate matched; CXView will not guess from a basename."
                 .to_owned(),
+            snippet_evidence: false,
         }),
         _ => Ok(ResolvedPath {
             state: MatchState::Unavailable,
@@ -309,6 +323,7 @@ pub fn resolve_finding_path(
             reason:
                 "The report path is unavailable and no unique snippet-backed relocation was found."
                     .to_owned(),
+            snippet_evidence: false,
         }),
     }
 }
@@ -318,6 +333,9 @@ pub struct ResolvedPath {
     pub absolute: Option<PathBuf>,
     pub relative: Option<String>,
     pub reason: String,
+    /// True when a relocation was supported by the reported snippet as well as a unique filename.
+    /// A relocation that rests on a filename alone is readable evidence but not edit authority.
+    pub snippet_evidence: bool,
 }
 
 pub fn load_code_context(
@@ -425,8 +443,13 @@ pub fn load_code_context(
     let hash = sha256_hex(&bytes);
     let line = finding.summary.line_start.unwrap_or(1).max(1);
     let total_lines = source.lines().count().max(1) as u32;
+    // A finding can report a line that no longer exists (the file shrank since the scan), so the
+    // reported line is clamped before the window is derived instead of subtracted past zero.
+    let line = line.min(total_lines);
     let range_start = line.saturating_sub(12).max(1);
-    let range_end = (finding.summary.line_end.unwrap_or(line).saturating_add(12)).min(total_lines);
+    let range_end = (finding.summary.line_end.unwrap_or(line).saturating_add(12))
+        .min(total_lines)
+        .max(range_start);
     let current_source = source
         .lines()
         .skip(range_start.saturating_sub(1) as usize)
@@ -732,7 +755,9 @@ pub fn nearest_package_root(root: &Path, report_path: Option<&str>) -> Option<Pa
         if current.join("package.json").is_file() {
             return Some(current);
         }
-        if !current.pop() {
+        // The search stops at the bound repository: a package root above it is outside the
+        // folder the user authorized, and its scripts must not be offered as local checks.
+        if current == canonical_root || !current.pop() || !current.starts_with(&canonical_root) {
             break;
         }
     }
@@ -851,6 +876,7 @@ fn as_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patching::capture_snapshot;
     use std::io::Write;
 
     #[test]
@@ -873,6 +899,37 @@ mod tests {
     }
 
     #[test]
+    fn a_relocation_without_a_snippet_is_readable_but_not_editable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("moved")).unwrap();
+        fs::write(root.join("moved/App.tsx"), "export const value = 1;\n").unwrap();
+
+        // A unique filename with no reported snippet relocates for reading...
+        let relocated = resolve_finding_path(root, Some("old/App.tsx"), None, None, None).unwrap();
+        assert!(matches!(relocated.state, MatchState::RelocatedWithEvidence));
+        assert!(!relocated.snippet_evidence);
+
+        // ...but the reported snippet is what turns a relocation into edit authority.
+        let with_snippet = resolve_finding_path(
+            root,
+            Some("old/App.tsx"),
+            None,
+            None,
+            Some("export const value"),
+        )
+        .unwrap();
+        assert!(with_snippet.snippet_evidence);
+
+        let finding = sast_finding("old/App.tsx", Some(1));
+        let refused = capture_snapshot(root, "task", "report", &finding, None, None);
+        assert!(
+            refused.is_err(),
+            "a filename-only relocation must not authorize a snapshot"
+        );
+    }
+
+    #[test]
     fn basename_without_evidence_is_not_an_edit_location() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -883,6 +940,86 @@ mod tests {
         let result =
             resolve_finding_path(root, Some("missing/index.ts"), None, None, None).unwrap();
         assert!(matches!(result.state, MatchState::Ambiguous));
+    }
+
+    #[test]
+    fn a_package_root_above_the_bound_repository_is_not_offered() {
+        let directory = tempfile::tempdir().unwrap();
+        let outer = directory.path();
+        fs::write(outer.join("package.json"), r#"{"scripts":{"test":"true"}}"#).unwrap();
+        let bound = outer.join("bound");
+        fs::create_dir_all(bound.join("nested")).unwrap();
+        fs::write(bound.join("package.json"), r#"{"scripts":{"test":"true"}}"#).unwrap();
+
+        // The bound repository has its own manifest, so it is used.
+        let found = nearest_package_root(&bound, None).unwrap();
+        assert_eq!(found.canonicalize().unwrap(), bound.canonicalize().unwrap());
+
+        // A sub-folder without a manifest must not fall back to the manifest outside the
+        // repository the user actually bound.
+        assert_eq!(nearest_package_root(&bound.join("nested"), None), None);
+    }
+
+    fn sast_finding(path: &str, line_start: Option<u32>) -> FindingRecord {
+        FindingRecord {
+            summary: FindingSummary {
+                id: "finding-sast".to_owned(),
+                report_id: "report".to_owned(),
+                fingerprint: "fp".to_owned(),
+                engine: "SAST".to_owned(),
+                scanner: Some("Checkmarx".to_owned()),
+                rule: Some("CXSAST-RAW-HTML".to_owned()),
+                title: "Untrusted data in raw HTML".to_owned(),
+                severity: "High".to_owned(),
+                original_severity: Some("High".to_owned()),
+                result_status: None,
+                triage_state: None,
+                category: FindingCategory::Sast,
+                file_path: Some(path.to_owned()),
+                package_name: None,
+                package_version: None,
+                scan_package_version: None,
+                line_start,
+                line_end: None,
+                evidence_readiness: EvidenceReadiness::Ready,
+                local_task_state: TaskState::Investigating,
+                raw_locator: "/scanResults/0/results/0".to_owned(),
+            },
+            description: None,
+            recommendation: None,
+            cwe: None,
+            query_id: None,
+            query_name: None,
+            evidence_links: vec![],
+            nodes: vec![],
+            reported_snippet: None,
+            advisory_aliases: vec![],
+            ecosystem: None,
+            affected_range: None,
+            fixed_range: None,
+            dependency_paths: vec![],
+            reachability: None,
+            resource: None,
+            iac_rule: None,
+            expected_value: None,
+            actual_value: None,
+            provider: None,
+            context: None,
+            raw: Value::Null,
+        }
+    }
+
+    #[test]
+    fn a_reported_line_past_the_end_of_the_file_is_clamped() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/App.tsx"), "one\ntwo\nthree\n").unwrap();
+        let context = load_code_context(root, &sast_finding("src/App.tsx", Some(900)), None, None)
+            .expect("a shrunken file must produce a bounded window, not a panic");
+        assert_eq!(context.current_range_start, Some(1));
+        assert_eq!(context.current_range_end, Some(3));
+        assert!(context.current_source.unwrap_or_default().contains("three"));
     }
 
     #[test]

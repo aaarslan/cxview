@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::comparison;
-use crate::db::Database;
+use crate::db::{Database, FindingQuery};
 use crate::error::{AppError, AppResult};
 use crate::importer::{self, parse_report};
 use crate::models::*;
@@ -30,19 +30,6 @@ pub struct BindRepositoryRequest {
     pub repository_path: String,
     pub scan_prefix: Option<String>,
     pub repository_prefix: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FindingQuery {
-    pub report_id: String,
-    pub search: Option<String>,
-    pub severity: Option<String>,
-    pub engine: Option<String>,
-    pub status: Option<String>,
-    pub saved_view: Option<String>,
-    pub page: Option<usize>,
-    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +102,9 @@ pub struct DeleteWorkspaceRequest {
 
 #[tauri::command]
 pub fn get_app_snapshot(state: State<'_, AppState>) -> AppResult<AppSnapshot> {
+    // Probed before the database lock is taken: this spawns the provider CLI when it is
+    // installed, and every other command waits on the same lock.
+    let provider = provider::codex_diagnostic();
     let db = state
         .db
         .lock()
@@ -129,8 +119,11 @@ pub fn get_app_snapshot(state: State<'_, AppState>) -> AppResult<AppSnapshot> {
     let diagnostics = report_id.and_then(|id| db.diagnostics_for_report(id).ok().flatten());
     let findings = report_id
         .map(|id| {
-            db.findings(id, "", None, None, None, None, 0, 100)
-                .unwrap_or_default()
+            db.findings(&FindingQuery {
+                report_id: id.to_owned(),
+                ..FindingQuery::default()
+            })
+            .unwrap_or_default()
         })
         .unwrap_or_default();
     let repository_context = profile.as_ref().and_then(|profile| {
@@ -154,7 +147,7 @@ pub fn get_app_snapshot(state: State<'_, AppState>) -> AppResult<AppSnapshot> {
         findings,
         repository: repository_context,
         tasks,
-        provider: provider::codex_diagnostic(),
+        provider,
     })
 }
 
@@ -192,7 +185,10 @@ pub fn import_report(
         let diagnostics = db
             .diagnostics_for_report(&existing.id)?
             .unwrap_or(parsed.diagnostics);
-        let findings = db.findings(&existing.id, "", None, None, None, None, 0, 100)?;
+        let findings = db.findings(&FindingQuery {
+            report_id: existing.id.clone(),
+            ..FindingQuery::default()
+        })?;
         return Ok(ImportResult {
             report: existing,
             diagnostics,
@@ -245,7 +241,10 @@ pub fn import_report(
         profile.report_id = Some(parsed.report.id.clone());
         db.upsert_profile(&profile, Some(&parsed.report.id))?;
     }
-    let findings = db.findings(&parsed.report.id, "", None, None, None, None, 0, 100)?;
+    let findings = db.findings(&FindingQuery {
+        report_id: parsed.report.id.clone(),
+        ..FindingQuery::default()
+    })?;
     let _ = app.emit("cxview://report-imported", &parsed.report.id);
     Ok(ImportResult {
         report: parsed.report,
@@ -301,16 +300,7 @@ pub fn list_findings(
         .db
         .lock()
         .map_err(|_| AppError::Database("database lock poisoned".to_owned()))?;
-    db.findings(
-        &query.report_id,
-        query.search.as_deref().unwrap_or_default(),
-        query.severity.as_deref(),
-        query.engine.as_deref(),
-        query.status.as_deref(),
-        query.saved_view.as_deref(),
-        query.page.unwrap_or(0),
-        query.page_size.unwrap_or(200).min(500),
-    )
+    db.findings(&query)
 }
 
 #[tauri::command]
@@ -787,13 +777,16 @@ pub fn run_validation(
         .write_lock
         .lock()
         .map_err(|_| AppError::Message("another repository operation is in progress".to_owned()))?;
-    let mut db = state
-        .db
-        .lock()
-        .map_err(|_| AppError::Database("database lock poisoned".to_owned()))?;
-    let task = db
-        .task(&request.task_id)?
-        .ok_or_else(|| AppError::Message("remediation task not found".to_owned()))?;
+    // The task is read and the database lock is released before the check runs. A check may take
+    // the full timeout, and holding the lock for that long would stall every other command.
+    let task = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| AppError::Database("database lock poisoned".to_owned()))?;
+        db.task(&request.task_id)?
+            .ok_or_else(|| AppError::Message("remediation task not found".to_owned()))?
+    };
     let root = repository::repository_root(&task.snapshot.repository_path)?;
     let run = validation::run_check(&root, &task, &request.candidate_id, request.approved)?;
     let next_state = match run.status {
@@ -806,6 +799,10 @@ pub fn run_validation(
         }
         _ => task.state.clone(),
     };
+    let mut db = state
+        .db
+        .lock()
+        .map_err(|_| AppError::Database("database lock poisoned".to_owned()))?;
     db.insert_validation(&run)?;
     db.update_task_state(&task.id, &next_state, None)?;
     Ok(run)
@@ -855,15 +852,22 @@ pub fn provider_diagnostic() -> ProviderDiagnostic {
 
 #[tauri::command]
 pub fn run_codex_proposal(state: State<'_, AppState>, task_id: String) -> AppResult<PatchReview> {
+    // The provider CLI is user initiated and can take a while, so the database lock is released
+    // while it runs and retaken only to persist the returned proposal.
+    let task = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| AppError::Database("database lock poisoned".to_owned()))?;
+        db.task(&task_id)?
+            .ok_or_else(|| AppError::Message("remediation task not found".to_owned()))?
+    };
+    let root = repository::repository_root(&task.snapshot.repository_path)?;
+    let (proposal, build, _log) = provider::codex_proposal(&task, &root, &state.storage)?;
     let mut db = state
         .db
         .lock()
         .map_err(|_| AppError::Database("database lock poisoned".to_owned()))?;
-    let task = db
-        .task(&task_id)?
-        .ok_or_else(|| AppError::Message("remediation task not found".to_owned()))?;
-    let root = repository::repository_root(&task.snapshot.repository_path)?;
-    let (proposal, build, _log) = provider::codex_proposal(&task, &root, &state.storage)?;
     db.update_task_proposal(&task.id, &TaskState::ProposalReady, &proposal, &build.diff)?;
     Ok(PatchReview {
         task_id: task.id,

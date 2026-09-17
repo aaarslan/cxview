@@ -10,6 +10,31 @@ pub struct Database {
     pub conn: Connection,
 }
 
+/// The finding list query. Shared with the command layer so the Tauri command argument and the
+/// SQL filter cannot drift apart.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingQuery {
+    pub report_id: String,
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub saved_view: Option<String>,
+    #[serde(default)]
+    pub page: Option<usize>,
+    #[serde(default)]
+    pub page_size: Option<usize>,
+}
+
+/// Upper bound on one page of findings, enforced in the query rather than at each call site.
+pub const MAX_FINDING_PAGE_SIZE: usize = 500;
+
 impl Database {
     pub fn open(path: &Path) -> AppResult<Self> {
         let conn = Connection::open(path)?;
@@ -153,7 +178,7 @@ impl Database {
             .query_row(
                 "SELECT id, source_name, source_path, sha256, adapter_id, adapter_version, imported_at, metadata_json, diagnostics_json FROM reports WHERE sha256 = ?1",
                 [sha256],
-                |row| report_from_row(row),
+                report_from_row,
             )
             .optional()
             .map_err(AppError::from)
@@ -240,7 +265,7 @@ impl Database {
             .query_row(
                 "SELECT id, source_name, source_path, sha256, adapter_id, adapter_version, imported_at, metadata_json, diagnostics_json FROM reports WHERE id = ?1",
                 [report_id],
-                |row| report_from_row(row),
+                report_from_row,
             )
             .optional()
             .map_err(AppError::from)
@@ -251,7 +276,7 @@ impl Database {
             .query_row(
                 "SELECT id, source_name, source_path, sha256, adapter_id, adapter_version, imported_at, metadata_json, diagnostics_json FROM reports ORDER BY imported_at DESC LIMIT 1",
                 [],
-                |row| report_from_row(row),
+                report_from_row,
             )
             .optional()
             .map_err(AppError::from)
@@ -271,49 +296,46 @@ impl Database {
     pub fn finding(&self, finding_id: &str) -> AppResult<Option<FindingRecord>> {
         self.conn
             .query_row(
-                "SELECT record_json FROM findings WHERE id = ?1",
+                "SELECT record_json, local_task_state FROM findings WHERE id = ?1",
                 [finding_id],
                 |row| {
                     let value: String = row.get(0)?;
-                    Ok(value)
+                    let state: String = row.get(1)?;
+                    Ok((value, state))
                 },
             )
             .optional()?
-            .map(|value| parse_finding_json(&value))
+            .map(|(value, state)| {
+                let mut record = parse_finding_json(&value)?;
+                apply_local_task_state(&mut record, &state);
+                Ok::<FindingRecord, serde_json::Error>(record)
+            })
             .transpose()
             .map_err(AppError::from)
     }
 
-    pub fn findings(
-        &self,
-        report_id: &str,
-        search: &str,
-        severity: Option<&str>,
-        engine: Option<&str>,
-        status: Option<&str>,
-        saved_view: Option<&str>,
-        page: usize,
-        page_size: usize,
-    ) -> AppResult<Vec<FindingSummary>> {
-        let mut query = String::from("SELECT record_json FROM findings WHERE report_id = ?1");
-        let mut args: Vec<String> = vec![report_id.to_owned()];
+    pub fn findings(&self, request: &FindingQuery) -> AppResult<Vec<FindingSummary>> {
+        let mut query =
+            String::from("SELECT record_json, local_task_state FROM findings WHERE report_id = ?1");
+        let mut args: Vec<String> = vec![request.report_id.to_owned()];
+        let search = request.search.as_deref().unwrap_or_default();
         if !search.trim().is_empty() {
             query.push_str(" AND (lower(title) LIKE lower(?2) OR lower(COALESCE(file_path, '')) LIKE lower(?2) OR lower(COALESCE(package_name, '')) LIKE lower(?2) OR lower(COALESCE(rule, '')) LIKE lower(?2))");
             args.push(format!("%{}%", search.trim()));
         }
-        if severity.is_some() {
+        if let Some(severity) = request.severity.as_deref() {
             query.push_str(&format!(" AND severity = ?{}", args.len() + 1));
-            args.push(severity.unwrap_or_default().to_owned());
+            args.push(severity.to_owned());
         }
-        if engine.is_some() {
+        if let Some(engine) = request.engine.as_deref() {
             query.push_str(&format!(" AND engine = ?{}", args.len() + 1));
-            args.push(engine.unwrap_or_default().to_owned());
+            args.push(engine.to_owned());
         }
-        if status.is_some() {
+        if let Some(status) = request.status.as_deref() {
             query.push_str(&format!(" AND result_status = ?{}", args.len() + 1));
-            args.push(status.unwrap_or_default().to_owned());
+            args.push(status.to_owned());
         }
-        if let Some(view) = saved_view {
+        if let Some(view) = request.saved_view.as_deref() {
             match view {
                 "needs-investigation" => query.push_str(" AND local_task_state = 'investigating'"),
                 "ready-to-review" => query.push_str(" AND local_task_state = 'proposalready'"),
@@ -325,6 +347,8 @@ impl Database {
             }
         }
         query.push_str(" ORDER BY CASE severity WHEN 'Critical' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 WHEN 'Low' THEN 3 ELSE 4 END, title LIMIT ? OFFSET ?");
+        let page = request.page.unwrap_or(0);
+        let page_size = request.page_size.unwrap_or(200).min(MAX_FINDING_PAGE_SIZE);
         let offset = page.saturating_mul(page_size);
         let limit_value = page_size as i64;
         let offset_value = offset as i64;
@@ -335,35 +359,40 @@ impl Database {
         values.push(&offset_value);
         let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
             let value: String = row.get(0)?;
-            Ok(value)
+            let state: String = row.get(1)?;
+            Ok((value, state))
         })?;
         let mut result = Vec::new();
         for row in rows {
-            let raw = row?;
-            let record: FindingRecord = parse_finding_json(&raw).map_err(|error| {
+            let (raw, state) = row?;
+            let mut record: FindingRecord = parse_finding_json(&raw).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
             })?;
+            apply_local_task_state(&mut record, &state);
             result.push(record.summary);
         }
         Ok(result)
     }
 
     pub fn all_findings_for_report(&self, report_id: &str) -> AppResult<Vec<FindingRecord>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT record_json FROM findings WHERE report_id = ?1 ORDER BY id")?;
+        let mut statement = self.conn.prepare(
+            "SELECT record_json, local_task_state FROM findings WHERE report_id = ?1 ORDER BY id",
+        )?;
         let rows = statement.query_map([report_id], |row| {
             let value: String = row.get(0)?;
-            Ok(value)
+            let state: String = row.get(1)?;
+            Ok((value, state))
         })?;
         let mut result = Vec::new();
         for row in rows {
-            let raw = row?;
-            result.push(parse_finding_json(&raw)?);
+            let (raw, state) = row?;
+            let mut record = parse_finding_json(&raw)?;
+            apply_local_task_state(&mut record, &state);
+            result.push(record);
         }
         Ok(result)
     }
@@ -392,7 +421,7 @@ impl Database {
             .query_row(
                 "SELECT id, name, repository_path, report_id, scan_prefix, repository_prefix, ui_state_json FROM profiles WHERE report_id = ?1 ORDER BY updated_at DESC LIMIT 1",
                 [report_id],
-                |row| profile_from_row(row),
+                profile_from_row,
             )
             .optional()
             .map_err(AppError::from)
@@ -403,7 +432,7 @@ impl Database {
             .query_row(
                 "SELECT id, name, repository_path, report_id, scan_prefix, repository_prefix, ui_state_json FROM profiles ORDER BY updated_at DESC LIMIT 1",
                 [],
-                |row| profile_from_row(row),
+                profile_from_row,
             )
             .optional()
             .map_err(AppError::from)
@@ -505,6 +534,25 @@ impl Database {
             "UPDATE tasks SET state = ?1, updated_at = ?2, patch_id = COALESCE(?3, patch_id) WHERE id = ?4",
             params![enum_json(state), chrono::Utc::now().to_rfc3339(), patch_id, task_id],
         )?;
+        // `findings.local_task_state` is the column the saved finding views filter on, so it is
+        // kept in step with the task that owns the finding.
+        let finding_ids: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT finding_ids_json FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = finding_ids {
+            let parsed: Vec<String> = serde_json::from_str(&raw)?;
+            for finding_id in parsed {
+                self.conn.execute(
+                    "UPDATE findings SET local_task_state = ?1 WHERE id = ?2",
+                    params![enum_json(state), finding_id],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -521,7 +569,7 @@ impl Database {
             .query_row(
                 "SELECT id, profile_id, report_id, finding_ids_json, state, created_at, updated_at, snapshot_json, proposal_json, diff, patch_id, notes FROM tasks WHERE id = ?1",
                 [task_id],
-                |row| task_from_row(row),
+                task_from_row,
             )
             .optional()
             .map_err(AppError::from)
@@ -529,7 +577,7 @@ impl Database {
 
     pub fn tasks_for_profile(&self, profile_id: &str) -> AppResult<Vec<RemediationTask>> {
         let mut statement = self.conn.prepare("SELECT id, profile_id, report_id, finding_ids_json, state, created_at, updated_at, snapshot_json, proposal_json, diff, patch_id, notes FROM tasks WHERE profile_id = ?1 ORDER BY updated_at DESC")?;
-        let rows = statement.query_map([profile_id], |row| task_from_row(row))?;
+        let rows = statement.query_map([profile_id], task_from_row)?;
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(row?);
@@ -545,8 +593,12 @@ impl Database {
         files: &[String],
         journal: &Value,
     ) -> AppResult<()> {
+        // The patch id is derived from the task and the diff, so re-applying the same reviewed
+        // change after an undo produces the same id. The row is replaced and its undo marker is
+        // cleared, because the write itself has already happened by the time this is recorded.
         self.conn.execute(
-            "INSERT INTO patches(id, task_id, diff, touched_files_json, journal_json, applied_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO patches(id, task_id, diff, touched_files_json, journal_json, applied_at, undone_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+             ON CONFLICT(id) DO UPDATE SET task_id = excluded.task_id, diff = excluded.diff, touched_files_json = excluded.touched_files_json, journal_json = excluded.journal_json, applied_at = excluded.applied_at, undone_at = NULL",
             params![patch_id, task_id, diff, json(files)?, json(journal)?, chrono::Utc::now().to_rfc3339()],
         )?;
         Ok(())
@@ -587,7 +639,7 @@ impl Database {
 
     pub fn validations_for_task(&self, task_id: &str) -> AppResult<Vec<ValidationRun>> {
         let mut statement = self.conn.prepare("SELECT id, task_id, candidate_id, status, exit_code, duration_ms, stdout, stderr, snapshot_hash, started_at, note FROM validation_runs WHERE task_id = ?1 ORDER BY started_at DESC")?;
-        let rows = statement.query_map([task_id], |row| validation_from_row(row))?;
+        let rows = statement.query_map([task_id], validation_from_row)?;
         let mut values = Vec::new();
         for row in rows {
             values.push(row?);
@@ -617,6 +669,15 @@ impl Database {
 
 fn json<T: serde::Serialize + ?Sized>(value: &T) -> AppResult<String> {
     serde_json::to_string(value).map_err(AppError::from)
+}
+
+/// `findings.local_task_state` is the mutable column the saved views filter on, while
+/// `record_json` is the immutable imported record. The column is authoritative when the two
+/// disagree, which is what keeps a task's progress visible in the finding list.
+fn apply_local_task_state(record: &mut FindingRecord, column: &str) {
+    if let Ok(state) = serde_json::from_value::<TaskState>(Value::String(column.to_owned())) {
+        record.summary.local_task_state = state;
+    }
 }
 
 fn parse_finding_json(value: &str) -> Result<FindingRecord, serde_json::Error> {
@@ -752,4 +813,113 @@ fn validation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ValidationRu
         started_at: row.get(9)?,
         note: row.get(10)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::importer::parse_report;
+
+    fn seeded_database() -> (Database, String, String) {
+        let mut db = Database::memory().unwrap();
+        let parsed = parse_report(
+            "results.json",
+            "/tmp/results.json",
+            br#"{"results":[{"id":"1","engine":"SAST","filePath":"src/a.ts","line":4,"severity":"High"}]}"#
+                .to_vec(),
+        )
+        .unwrap();
+        db.insert_report(
+            &parsed.report,
+            &parsed.diagnostics,
+            "/tmp/raw.json",
+            &parsed.findings,
+        )
+        .unwrap();
+        let report_id = parsed.report.id.clone();
+        let finding_id = parsed.findings[0].summary.id.clone();
+        let task = RemediationTask {
+            id: "task-1".to_owned(),
+            profile_id: "profile-1".to_owned(),
+            report_id: report_id.clone(),
+            finding_ids: vec![finding_id.clone()],
+            state: TaskState::Investigating,
+            created_at: "now".to_owned(),
+            updated_at: "now".to_owned(),
+            snapshot: SnapshotManifest {
+                task_id: "task-1".to_owned(),
+                report_id: report_id.clone(),
+                repository_path: "/tmp".to_owned(),
+                branch: None,
+                head_commit: None,
+                captured_at: "now".to_owned(),
+                files: Vec::new(),
+            },
+            proposal: None,
+            diff: None,
+            patch_id: None,
+            notes: String::new(),
+        };
+        db.insert_task(&task).unwrap();
+        (db, report_id, finding_id)
+    }
+
+    fn count_in_view(db: &Database, report_id: &str, view: &str) -> usize {
+        let request = FindingQuery {
+            report_id: report_id.to_owned(),
+            saved_view: Some(view.to_owned()),
+            page_size: Some(50),
+            ..FindingQuery::default()
+        };
+        db.findings(&request).unwrap().len()
+    }
+
+    #[test]
+    fn saved_views_follow_the_task_state_of_their_findings() {
+        let (mut db, report_id, finding_id) = seeded_database();
+        assert_eq!(count_in_view(&db, &report_id, "needs-investigation"), 1);
+        assert_eq!(count_in_view(&db, &report_id, "ready-to-review"), 0);
+
+        db.update_task_state("task-1", &TaskState::ProposalReady, None)
+            .unwrap();
+        assert_eq!(count_in_view(&db, &report_id, "needs-investigation"), 0);
+        assert_eq!(count_in_view(&db, &report_id, "ready-to-review"), 1);
+
+        db.update_task_state("task-1", &TaskState::AwaitingRescan, None)
+            .unwrap();
+        assert_eq!(count_in_view(&db, &report_id, "awaiting-rescan"), 1);
+        assert!(matches!(
+            db.finding(&finding_id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .local_task_state,
+            TaskState::AwaitingRescan
+        ));
+    }
+
+    #[test]
+    fn reapplying_the_same_patch_replaces_its_journal_row() {
+        let (mut db, _, _) = seeded_database();
+        let files = vec!["src/a.ts".to_owned()];
+        let journal = serde_json::json!([]);
+        db.insert_patch("patch-1", "task-1", "diff", &files, &journal)
+            .unwrap();
+        db.mark_patch_undone("patch-1").unwrap();
+        // Apply → undo → apply rebuilds the same deterministic patch id, and the file write has
+        // already happened by the time the journal row is recorded.
+        db.insert_patch("patch-1", "task-1", "diff", &files, &journal)
+            .unwrap();
+        let (task_id, _) = db.patch_journal("patch-1").unwrap().unwrap();
+        assert_eq!(task_id, "task-1");
+        let undone_at: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT undone_at FROM patches WHERE id = 'patch-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(undone_at.is_none());
+    }
 }

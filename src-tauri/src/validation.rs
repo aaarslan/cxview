@@ -17,11 +17,17 @@ use crate::repository::{detect_package_manager, safe_relative_path};
 
 const MAX_OUTPUT_BYTES: usize = 96 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 pub fn discover_checks(root: &Path) -> AppResult<Vec<ValidationCandidate>> {
     let package_root =
         crate::repository::nearest_package_root(root, None).unwrap_or_else(|| root.to_owned());
     let package_json_path = package_root.join("package.json");
+    if !package_json_path.is_file() {
+        return Err(AppError::Message(
+            "No package.json was found inside the bound repository; CXView does not run scripts discovered outside it.".to_owned(),
+        ));
+    }
     let package_json_bytes = fs::read(&package_json_path).map_err(|source| AppError::Io {
         path: package_json_path.clone(),
         source,
@@ -162,8 +168,7 @@ pub fn run_check(
         }
         thread::sleep(Duration::from_millis(40));
     };
-    let _ = out_handle.join();
-    let _ = err_handle.join();
+    drain_output_readers([out_handle, err_handle]);
     let stdout = String::from_utf8_lossy(
         &out_buffer
             .lock()
@@ -176,6 +181,14 @@ pub fn run_check(
             .map_err(|_| AppError::Process("stderr buffer lock poisoned".to_owned()))?,
     )
     .into_owned();
+    let output_truncated = out_buffer
+        .lock()
+        .map(|buffer| buffer.len() >= MAX_OUTPUT_BYTES)
+        .unwrap_or(false)
+        || err_buffer
+            .lock()
+            .map(|buffer| buffer.len() >= MAX_OUTPUT_BYTES)
+            .unwrap_or(false);
     let status_kind = if timed_out {
         ValidationStatus::TimedOut
     } else if status.success() {
@@ -196,6 +209,14 @@ pub fn run_check(
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "no code".to_owned())
         )
+    };
+    let note = if output_truncated {
+        format!(
+            "{note} Retained output was capped at {} bytes.",
+            MAX_OUTPUT_BYTES
+        )
+    } else {
+        note
     };
     Ok(ValidationRun {
         id: format!("validation-{}", Uuid::new_v4()),
@@ -262,19 +283,38 @@ fn current_source_hash(root: &Path, task: &RemediationTask) -> AppResult<String>
     let mut entries = Vec::new();
     for manifest in &task.snapshot.files {
         let path = safe_relative_path(root, &manifest.path, manifest.expected_absent)?;
-        let bytes = fs::read(&path).unwrap_or_default();
-        entries.push(format!("{}:{}", manifest.path, sha256_hex(&bytes)));
+        entries.push(format!(
+            "{}:{}",
+            manifest.path,
+            sha256_hex(&read_source_or_absent(&path)?)
+        ));
     }
     if let Some(proposal) = &task.proposal {
         for edit in proposal.edits.iter().filter(|edit| edit.expected_absent) {
             let path = root.join(&edit.path);
             if path.exists() {
-                let bytes = fs::read(&path).unwrap_or_default();
-                entries.push(format!("{}:{}", edit.path, sha256_hex(&bytes)));
+                entries.push(format!(
+                    "{}:{}",
+                    edit.path,
+                    sha256_hex(&read_source_or_absent(&path)?)
+                ));
             }
         }
     }
     Ok(sha256_hex(entries.join("|").as_bytes()))
+}
+
+/// A missing file is a real drift signal, but a permission or I/O failure is not the same fact.
+/// Treating both as "absent" would report an unreadable file as a stale baseline.
+fn read_source_or_absent(path: &Path) -> AppResult<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(AppError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -290,12 +330,12 @@ fn spawn_reader<R: Read + Send + 'static>(
                     if let Ok(mut target) = buffer.lock() {
                         let remaining = MAX_OUTPUT_BYTES.saturating_sub(target.len());
                         target.extend_from_slice(&chunk[..size.min(remaining)]);
-                        if target.len() >= MAX_OUTPUT_BYTES {
-                            break;
-                        }
                     } else {
                         break;
                     }
+                    // Reading continues past the retained-output cap, and bytes beyond it are
+                    // discarded. Closing the pipe instead would kill a verbose but passing
+                    // check with SIGPIPE, and its exit status would be recorded as a failure.
                 }
             }
         }
@@ -303,6 +343,9 @@ fn spawn_reader<R: Read + Send + 'static>(
 }
 
 fn terminate_process(child: &mut Child) {
+    // Windows reaches the descendant tree through taskkill. On Unix only the direct child is
+    // signalled; a descendant that keeps the inherited pipes open is handled by the bounded
+    // drain wait in `run_check` rather than by an unbounded join.
     #[cfg(unix)]
     {
         let _ = child.kill();
@@ -315,12 +358,33 @@ fn terminate_process(child: &mut Child) {
             .arg(pid.to_string())
             .args(["/T", "/F"])
             .status();
+        let _ = child.kill();
     }
 }
 
+/// Waits briefly for the output readers to finish. The check's status is already known at this
+/// point, so a descendant holding the inherited pipes must not extend the run indefinitely.
+fn drain_output_readers(handles: [thread::JoinHandle<()>; 2]) {
+    let deadline = Instant::now() + PIPE_DRAIN_GRACE;
+    for handle in handles {
+        while !handle.is_finished() {
+            if Instant::now() >= deadline {
+                // The reader thread is abandoned; the retained bytes stay readable because the
+                // buffer lock is only held while appending.
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Matches whole script-name tokens so that `inspect`, `contest`, or `prototype` are not offered
+/// as check candidates, while `test:unit`, `type-check`, and `testE2E` still are.
 fn is_check_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    [
+    const WORDS: [&str; 8] = [
         "test",
         "check",
         "type",
@@ -329,9 +393,17 @@ fn is_check_name(name: &str) -> bool {
         "build",
         "verify",
         "spec",
-    ]
-    .iter()
-    .any(|word| lower == *word || lower.contains(word))
+    ];
+    name.split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            let lower = token.to_ascii_lowercase();
+            WORDS.iter().any(|word| {
+                lower == *word
+                    || (lower.starts_with(word)
+                        && token[word.len()..].starts_with(char::is_uppercase))
+            })
+        })
 }
 
 #[cfg(test)]
@@ -394,5 +466,81 @@ mod tests {
         assert!(matches!(run.status, ValidationStatus::Passed));
         assert_eq!(run.exit_code, Some(0));
         assert!(run.stdout.contains("fixture-pass"));
+    }
+
+    fn task_for(root: &Path, package_json: &str) -> RemediationTask {
+        RemediationTask {
+            id: "task-validation".to_owned(),
+            profile_id: "profile".to_owned(),
+            report_id: "report".to_owned(),
+            finding_ids: vec!["finding".to_owned()],
+            state: TaskState::Investigating,
+            created_at: "now".to_owned(),
+            updated_at: "now".to_owned(),
+            snapshot: SnapshotManifest {
+                task_id: "task-validation".to_owned(),
+                report_id: "report".to_owned(),
+                repository_path: root.to_string_lossy().into_owned(),
+                branch: None,
+                head_commit: None,
+                captured_at: "now".to_owned(),
+                files: vec![FileManifest {
+                    path: "package.json".to_owned(),
+                    sha256: sha256_hex(package_json.as_bytes()),
+                    byte_length: package_json.len(),
+                    line_ending: "LF".to_owned(),
+                    content: Some(package_json.to_owned()),
+                    expected_absent: false,
+                }],
+            },
+            proposal: None,
+            diff: None,
+            patch_id: None,
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_verbose_passing_check_keeps_its_real_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let package_json =
+            r#"{"scripts":{"test":"node -e \"process.stdout.write('x'.repeat(150000))\""}}"#;
+        fs::write(root.join("package.json"), package_json).unwrap();
+        let task = task_for(root, package_json);
+        let candidate = discover_checks(root).unwrap().remove(0);
+        let run = run_check(root, &task, &candidate.id, true).unwrap();
+        // Output past the retained cap is discarded, not turned into a SIGPIPE failure.
+        assert!(matches!(run.status, ValidationStatus::Passed));
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.stdout.len(), MAX_OUTPUT_BYTES);
+        assert!(run.note.contains("capped"));
+    }
+
+    #[test]
+    fn script_names_are_matched_on_token_boundaries() {
+        for name in [
+            "test",
+            "typecheck",
+            "test:unit",
+            "testE2E",
+            "type-check",
+            "lint-staged",
+            "build",
+            "verify",
+        ] {
+            assert!(is_check_name(name), "{name} should be offered as a check");
+        }
+        for name in [
+            "inspect",
+            "contest",
+            "prototype",
+            "format",
+            "start",
+            "dev",
+            "deploy",
+        ] {
+            assert!(!is_check_name(name), "{name} should not be a check");
+        }
     }
 }

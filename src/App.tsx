@@ -98,6 +98,10 @@ function ModalShell({ titleId, onClose, restoreFocus, className = "", children }
 const CodeSurface = lazy(() => import("./components/CodeSurface").then(({ CodeSurface: Component }) => ({ default: Component })));
 const DiffSurface = lazy(() => import("./components/CodeSurface").then(({ DiffSurface: Component }) => ({ default: Component })));
 
+// Page size requested for the finding queue. The native query caps a page at 500, and the queue
+// labels a full page as "or more" instead of implying the list is complete.
+const FINDING_PAGE_SIZE = 200;
+
 const taskLabels: Record<TaskState, string> = {
   investigating: "Investigating",
   proposalready: "Proposal ready",
@@ -116,6 +120,38 @@ const matchLabels: Record<string, string> = {
   currentfilediffers: "Current file differs",
   notapplicable: "Not applicable",
 };
+
+// Which overlays are mounted, and therefore whether the workbench behind them is inert. Deriving
+// both from one place keeps `inert`/`aria-hidden` in step with what is rendered: a stale flag with
+// no mounted dialog would leave the window with no interactive content.
+export function overlayFlags(input: {
+  showBind: boolean;
+  report?: ReportSummary;
+  review?: PatchReview;
+  modal: Modal;
+  task?: RemediationTask;
+  investigation?: InvestigationBundle;
+  commandCandidate?: ValidationCandidate;
+  validationOpen: boolean;
+  rawInspection?: RawInspection;
+  storageOpen: boolean;
+  storage?: StorageInfo;
+}) {
+  const flags = {
+    bind: input.showBind && Boolean(input.report),
+    reviewDialog: Boolean(input.review),
+    proposal: input.modal === "proposal" && Boolean(input.task && input.investigation),
+    command: input.modal === "command" && Boolean(input.commandCandidate && input.task),
+    provider: input.modal === "provider",
+    validation: input.validationOpen,
+    raw: Boolean(input.rawInspection),
+    storageDialog: input.storageOpen && Boolean(input.storage),
+  };
+  return {
+    ...flags,
+    blocking: flags.bind || flags.reviewDialog || flags.proposal || flags.command || flags.provider || flags.validation || flags.raw || flags.storageDialog,
+  };
+}
 
 function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>({ findings: [], tasks: [], provider: emptyProvider() });
@@ -219,6 +255,22 @@ function App() {
     void refresh();
   }, [refresh]);
 
+  const applyImport = useCallback((result: ImportResult) => {
+    setReport(result.report);
+    setDiagnostics(result.diagnostics);
+    setFindings(result.findings);
+    setComparison(result.comparison);
+    setSelectedId(result.findings[0]?.id);
+    setInvestigation(undefined);
+    setTask(undefined);
+    setReview(undefined);
+    // A new report invalidates every dialog that was bound to the previous task, including the
+    // command approval that is suspended behind the validation drawer.
+    setModal(null);
+    setCommandCandidate(undefined);
+    setShowBind(!repository);
+  }, [repository]);
+
   const acceptDroppedPaths = useCallback(async (paths: string[]) => {
     const candidate = paths[0];
     if (!candidate) return;
@@ -237,7 +289,7 @@ function App() {
         notify("success", `Imported ${result.report.sourceName}: ${result.diagnostics.parsedInstances} individual finding instances retained.`);
       } catch (error) { notify("error", errorMessage(error)); } finally { setLoading(false); }
     }
-  }, [notify]);
+  }, [applyImport, notify]);
 
   useEffect(() => {
     let disposed = false;
@@ -245,7 +297,7 @@ function App() {
     if (api.isNative) {
       void getCurrentWebview().onDragDropEvent((event) => {
         if (event.payload.type === "drop") void acceptDroppedPaths(event.payload.paths);
-      }).then((dispose) => { if (disposed) dispose(); else unlisten = dispose; });
+      }).then((dispose) => { if (disposed) dispose(); else unlisten = dispose; }).catch((error) => notify("error", errorMessage(error)));
     } else {
       const onDrop = (event: DragEvent) => {
         event.preventDefault();
@@ -263,7 +315,8 @@ function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); searchRef.current?.focus(); return; }
       const target = event.target;
-      if (event.defaultPrevented || target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target instanceof HTMLButtonElement || (target instanceof HTMLElement && target.closest('[role="dialog"]')) || !findings.length) return;
+      // The list shortcuts stay out of text entry, the read-only code surface, and any dialog.
+      if (event.defaultPrevented || target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || (target instanceof HTMLElement && target.closest('[role="dialog"], [contenteditable="true"], [role="textbox"], .cm-editor')) || !findings.length) return;
       if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") { event.preventDefault(); moveFinding(1); }
       if (event.key === "ArrowUp" || event.key.toLowerCase() === "k") { event.preventDefault(); moveFinding(-1); }
     };
@@ -285,7 +338,7 @@ function App() {
       return () => { cancelled = true; };
     }
     const timer = window.setTimeout(() => {
-      void api.listFindings({ reportId: report.id, search, severity: severityFilter || undefined, engine: engineFilter || undefined, status: statusFilter || undefined, savedView: savedView || undefined, page: 0, pageSize: 200 }).then((next) => {
+      void api.listFindings({ reportId: report.id, search, severity: severityFilter || undefined, engine: engineFilter || undefined, status: statusFilter || undefined, savedView: savedView || undefined, page: 0, pageSize: FINDING_PAGE_SIZE }).then((next) => {
         if (!cancelled && requestId === findingsRequestId.current) setFindings(next);
       }).catch((error) => {
         if (!cancelled && requestId === findingsRequestId.current) notify("error", errorMessage(error));
@@ -379,31 +432,24 @@ function App() {
     }
   };
 
-  const applyImport = (result: ImportResult) => {
-    setReport(result.report);
-    setDiagnostics(result.diagnostics);
-    setFindings(result.findings);
-    setComparison(result.comparison);
-    setSelectedId(result.findings[0]?.id);
-    setInvestigation(undefined);
-    setTask(undefined);
-    setReview(undefined);
-    setShowBind(!repository);
-  };
-
   const openReport = async () => {
     rememberOverlayTrigger();
-    const path = await api.chooseReport();
-    if (!path) { if (!api.isNative) notify("info", "Run `pnpm tauri dev` to use native file selection."); return; }
     setLoading(true);
-    try { applyImport(await api.importReport(path)); notify("success", "Report imported as an immutable snapshot; inspect diagnostics before trusting the parsed count."); } catch (error) { notify("error", errorMessage(error)); } finally { setLoading(false); }
+    try {
+      const path = await api.chooseReport();
+      if (!path) { if (!api.isNative) notify("info", "Run `pnpm tauri dev` to use native file selection."); return; }
+      applyImport(await api.importReport(path));
+      notify("success", "Report imported as an immutable snapshot; inspect diagnostics before trusting the parsed count.");
+    } catch (error) { notify("error", errorMessage(error)); } finally { setLoading(false); }
   };
 
   const chooseRepo = async () => {
     rememberOverlayTrigger();
-    const path = await api.chooseRepository();
-    if (!path) { if (!api.isNative) notify("info", "Run `pnpm tauri dev` to use native folder selection."); return; }
-    setRepoPath(path); setShowBind(true);
+    try {
+      const path = await api.chooseRepository();
+      if (!path) { if (!api.isNative) notify("info", "Run `pnpm tauri dev` to use native folder selection."); return; }
+      setRepoPath(path); setShowBind(true);
+    } catch (error) { notify("error", errorMessage(error)); }
   };
 
   const bindRepo = async () => {
@@ -483,17 +529,26 @@ function App() {
     rememberOverlayTrigger();
     const current = task ?? await ensureTask();
     if (!current) return;
-    const path = await api.chooseProposal();
-    if (!path) return;
-    try { const next = await api.importProposal(current.id, path); setTask(await api.getTask(current.id)); setReview(next); setReviewed(false); notify("success", "External proposal imported as a bound, un-applied proposal. Review it before any write."); } catch (error) { notify("error", errorMessage(error)); }
+    try {
+      const path = await api.chooseProposal();
+      if (!path) return;
+      const next = await api.importProposal(current.id, path);
+      setTask(await api.getTask(current.id));
+      setReview(next);
+      setReviewed(false);
+      notify("success", "External proposal imported as a bound, un-applied proposal. Review it before any write.");
+    } catch (error) { notify("error", errorMessage(error)); }
   };
 
   const exportTask = async () => {
     const current = task ?? await ensureTask();
     if (!current) return;
-    const path = await api.chooseExportPath(`cxview-${current.id}.json`);
-    if (!path) return;
-    try { await api.exportTask(current.id, path); notify("success", `Task bundle exported to ${path}. Review proprietary source and scanner evidence before sharing.`); } catch (error) { notify("error", errorMessage(error)); }
+    try {
+      const path = await api.chooseExportPath(`cxview-${current.id}.json`);
+      if (!path) return;
+      await api.exportTask(current.id, path);
+      notify("success", `Task bundle exported to ${path}. Review proprietary source and scanner evidence before sharing.`);
+    } catch (error) { notify("error", errorMessage(error)); }
   };
 
   const copyPrompt = async () => {
@@ -565,7 +620,13 @@ function App() {
 
   const selected = findings.find((finding) => finding.id === selectedId);
   const activeFilters = [severityFilter && `severity: ${severityFilter}`, engineFilter && `engine: ${engineFilter}`, statusFilter && `status: ${statusFilter}`, savedView && `view: ${viewLabel(savedView)}`].filter(Boolean) as string[];
-  const hasBlockingOverlay = Boolean(showBind || review || modal || validationOpen || rawInspection || storageOpen);
+  const overlays = overlayFlags({ showBind, report, review, modal, task, investigation, commandCandidate, validationOpen, rawInspection, storageOpen, storage });
+  const bindOpen = overlays.bind;
+  const proposalOpen = overlays.proposal;
+  const commandOpen = overlays.command;
+  const providerOpen = overlays.provider;
+  const storageDialogOpen = overlays.storageDialog;
+  const hasBlockingOverlay = overlays.blocking;
   const workflowStage: WorkflowStage = validationOpen || task?.patchId ? "validation" : review || task?.proposal ? "review" : task ? "proposal" : selected ? "evidence" : "triage";
   const workflowIndex = workflowSteps.findIndex((step) => step.id === workflowStage);
 
@@ -594,7 +655,7 @@ function App() {
         </nav>
         <div ref={workspaceRef} className={styles.workspace} style={{ gridTemplateColumns: `${leftWidth}px 8px minmax(380px, 1fr) 8px ${rightWidth}px` }}>
           <aside className={`${styles.pane} ${styles.queuePane}`} aria-label="Finding work queue">
-            <div className={styles.paneHeader}><div><h2>Findings</h2><span className={styles.paneSubtitle}>{findings.length === 0 ? "No findings in this view" : `${findings.length}${findings.length === 200 ? "+" : ""} in current view`}</span></div><span className={styles.countBadge}>{findings.length}{findings.length === 200 ? "+" : ""}</span></div>
+            <div className={styles.paneHeader}><div><h2>Findings</h2><span className={styles.paneSubtitle}>{findings.length === 0 ? "No findings in this view" : `${findings.length}${findings.length === FINDING_PAGE_SIZE ? " or more" : ""} in current view`}</span></div><span className={styles.countBadge}>{findings.length}{findings.length === FINDING_PAGE_SIZE ? "+" : ""}</span></div>
             <div className={styles.searchWrap}><span className={styles.searchIcon}><Icon name="search" /></span><input ref={searchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search rule, file, package…" aria-label="Search findings" /><kbd>Ctrl/⌘ K</kbd></div>
             <div className={styles.filterGrid}><select value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value)} aria-label="Filter severity"><option value="">All severity</option><option>Critical</option><option>High</option><option>Medium</option><option>Low</option><option>Informational</option><option>Unknown</option></select><select value={engineFilter} onChange={(event) => setEngineFilter(event.target.value)} aria-label="Filter scanner engine"><option value="">All engines</option><option>SAST</option><option>SCA</option><option>IaC</option><option>Unknown</option></select></div>
             <select className={styles.savedView} value={savedView} onChange={(event) => setSavedView(event.target.value)} aria-label="Saved finding view"><option value="">All findings</option><option value="needs-investigation">Needs investigation</option><option value="ready-to-review">Ready to review</option><option value="patched-awaiting-validation">Patched awaiting validation</option><option value="awaiting-rescan">Awaiting rescan</option></select>
@@ -618,14 +679,14 @@ function App() {
         {diagnostics && <DiagnosticsStrip diagnostics={diagnostics} report={report} comparison={comparison} />}
       </>}
       </div>
-      {showBind && report && <BindRepositoryDialog report={report} path={repoPath} scanPrefix={scanPrefix} repositoryPrefix={repositoryPrefix} restoreFocus={overlayReturnFocus.current} onPathChange={setRepoPath} onScanPrefixChange={setScanPrefix} onRepositoryPrefixChange={setRepositoryPrefix} onBind={() => void bindRepo()} onCancel={() => setShowBind(false)} />}
-      {review && <ReviewDialog review={review} reviewed={reviewed} onReviewed={setReviewed} onApply={() => void applyPatch()} onClose={() => setReview(undefined)} repository={repository} restoreFocus={overlayReturnFocus.current} />}
-      {modal === "proposal" && task && investigation && <ProposalDialog task={task} investigation={investigation} restoreFocus={overlayReturnFocus.current} onClose={() => setModal(null)} onCreated={(next) => { rememberOverlayTrigger(); setReview(next); setReviewed(false); void api.getTask(task.id).then(setTask).catch(() => undefined); setModal(null); notify("success", "Proposal buffer converted into a real, precondition-checked diff. Review it before applying."); }} />}
-      {modal === "command" && commandCandidate && task && <CommandDialog candidate={commandCandidate} restoreFocus={overlayReturnFocus.current} onCancel={() => setModal(null)} onApprove={() => void confirmCommand()} />}
-      {modal === "provider" && <ProviderDialog provider={provider} hasTask={Boolean(task)} restoreFocus={overlayReturnFocus.current} onClose={() => setModal(null)} onGenerate={() => void runProviderProposal()} />}
-      {validationOpen && <ValidationDrawer candidates={validationCandidates} runs={validationRuns} loading={validationLoading} error={validationError} suspended={modal === "command"} restoreFocus={overlayReturnFocus.current} onClose={() => { validationRequestId.current += 1; setValidationOpen(false); }} onRetry={() => void openValidation()} onRun={(candidate, trigger) => { overlayReturnFocus.current = trigger; setCommandCandidate(candidate); setModal("command"); }} />}
-      {rawInspection && <RawInspectionDialog inspection={rawInspection} restoreFocus={overlayReturnFocus.current} onClose={() => setRawInspection(undefined)} />}
-      {storageOpen && storage && <StorageDialog profile={profile} info={storage} restoreFocus={overlayReturnFocus.current} onClose={() => setStorageOpen(false)} onDelete={(confirmation) => void deleteWorkspace(confirmation)} />}
+      {bindOpen && report && <BindRepositoryDialog report={report} path={repoPath} scanPrefix={scanPrefix} repositoryPrefix={repositoryPrefix} restoreFocus={overlayReturnFocus.current} onPathChange={setRepoPath} onScanPrefixChange={setScanPrefix} onRepositoryPrefixChange={setRepositoryPrefix} onBind={() => void bindRepo()} onCancel={() => setShowBind(false)} />}
+      {overlays.reviewDialog && review && <ReviewDialog review={review} reviewed={reviewed} onReviewed={setReviewed} onApply={() => void applyPatch()} onClose={() => setReview(undefined)} repository={repository} restoreFocus={overlayReturnFocus.current} />}
+      {proposalOpen && task && investigation && <ProposalDialog task={task} investigation={investigation} restoreFocus={overlayReturnFocus.current} onClose={() => setModal(null)} onError={(text) => notify("error", text)} onCreated={(next) => { rememberOverlayTrigger(); setReview(next); setReviewed(false); void api.getTask(task.id).then(setTask).catch(() => undefined); setModal(null); notify("success", "Proposal buffer converted into a real, precondition-checked diff. Review it before applying."); }} />}
+      {commandOpen && commandCandidate && task && <CommandDialog candidate={commandCandidate} restoreFocus={overlayReturnFocus.current} onCancel={() => setModal(null)} onApprove={() => void confirmCommand()} />}
+      {providerOpen && <ProviderDialog provider={provider} hasTask={Boolean(task)} restoreFocus={overlayReturnFocus.current} onClose={() => setModal(null)} onGenerate={() => void runProviderProposal()} />}
+      {overlays.validation && <ValidationDrawer candidates={validationCandidates} runs={validationRuns} loading={validationLoading} error={validationError} suspended={modal === "command"} restoreFocus={overlayReturnFocus.current} onClose={() => { validationRequestId.current += 1; setValidationOpen(false); }} onRetry={() => void openValidation()} onRun={(candidate, trigger) => { overlayReturnFocus.current = trigger; setCommandCandidate(candidate); setModal("command"); }} />}
+      {overlays.raw && rawInspection && <RawInspectionDialog inspection={rawInspection} restoreFocus={overlayReturnFocus.current} onClose={() => setRawInspection(undefined)} />}
+      {storageDialogOpen && storage && <StorageDialog profile={profile} info={storage} restoreFocus={overlayReturnFocus.current} onClose={() => setStorageOpen(false)} onDelete={(confirmation) => void deleteWorkspace(confirmation)} />}
     </main>
   );
 }
@@ -681,12 +742,13 @@ function BindRepositoryDialog({ report, path, scanPrefix, repositoryPrefix, onPa
   return <ModalShell titleId="bind-title" onClose={onCancel} restoreFocus={restoreFocus}><div className={styles.modalHeader}><div><h2 id="bind-title">Bind the scanned repository</h2></div><button className={styles.iconButton} onClick={onCancel} aria-label="Close"><Icon name="close" /></button></div><p>Choose the local folder that should be inspected for <strong>{report.sourceName}</strong>. This grants read access for the active workspace; it does not authorize patches.</p><label>Repository folder<input autoFocus value={path} onChange={(event) => onPathChange(event.target.value)} placeholder="Select a folder…" /></label><div className={styles.mappingGrid}><label>Scan prefix <input value={scanPrefix} onChange={(event) => onScanPrefixChange(event.target.value)} placeholder="e.g. C:\\agent\\repo" /></label><label>Repository prefix <input value={repositoryPrefix} onChange={(event) => onRepositoryPrefixChange(event.target.value)} placeholder="e.g. packages/web" /></label></div><p className={styles.modalHint}>A prefix mapping is saved as evidence and never selects a file by basename. Ambiguous or unavailable paths remain non-editable.</p><div className={styles.modalActions}><button className={styles.secondaryButton} onClick={onCancel}>Cancel</button><button className={styles.primaryButton} onClick={onBind} disabled={!path}>Confirm repository</button></div></ModalShell>;
 }
 
-function ProposalDialog({ task, investigation, onClose, onCreated, restoreFocus }: { task: RemediationTask; investigation: InvestigationBundle; onClose: () => void; onCreated: (review: PatchReview) => void } & RestoreFocusProp) {
+function ProposalDialog({ task, investigation, onClose, onCreated, onError, restoreFocus }: { task: RemediationTask; investigation: InvestigationBundle; onClose: () => void; onCreated: (review: PatchReview) => void; onError: (message: string) => void } & RestoreFocusProp) {
   const defaultPath = investigation.context.relativePath ?? investigation.finding.filePath ?? task.snapshot.files[0]?.path ?? "";
-  const defaultOld = task.snapshot.files.find((file) => file.path === defaultPath)?.content?.slice(0, 0) ?? "";
   const [diagnosis, setDiagnosis] = useState(`Manual proposal for ${investigation.finding.title}`);
   const [path, setPath] = useState(defaultPath);
-  const [oldText, setOldText] = useState(defaultOld);
+  // The anchor is intentionally empty: the snapshot pre-fill was a no-op, and an empty anchor
+  // keeps the reviewer pasting the exact span instead of accepting a generated one.
+  const [oldText, setOldText] = useState("");
   const [newText, setNewText] = useState("");
   const [behavior, setBehavior] = useState(investigation.playbook.behaviorPreservation[0] ?? "");
   const [tests, setTests] = useState(investigation.playbook.regressionTests[0] ?? "");
@@ -694,7 +756,7 @@ function ProposalDialog({ task, investigation, onClose, onCreated, restoreFocus 
   const [submitting, setSubmitting] = useState(false);
   const submit = async () => {
     setSubmitting(true);
-    try { const review = await api.createManualProposal(task.id, { diagnosis, assumptions: [], edits: [{ path, oldText, newText, expectedAbsent }], behaviorPreservation: behavior ? [behavior] : [], suggestedTests: tests ? [tests] : [], unresolvedQuestions: [], evidenceRefs: [investigation.finding.rawLocator] }); onCreated(review); } catch (error) { window.alert(errorMessage(error)); } finally { setSubmitting(false); }
+    try { const review = await api.createManualProposal(task.id, { diagnosis, assumptions: [], edits: [{ path, oldText, newText, expectedAbsent }], behaviorPreservation: behavior ? [behavior] : [], suggestedTests: tests ? [tests] : [], unresolvedQuestions: [], evidenceRefs: [investigation.finding.rawLocator] }); onCreated(review); } catch (error) { onError(errorMessage(error)); } finally { setSubmitting(false); }
   };
   return <ModalShell titleId="proposal-title" className={styles.proposalModal} onClose={onClose} restoreFocus={restoreFocus}><div className={styles.modalHeader}><div><h2 id="proposal-title">Prepare a candidate repair</h2></div><button className={styles.iconButton} onClick={onClose} aria-label="Close"><Icon name="close" /></button></div><p>These exact text anchors are validated against the captured snapshot. The live file remains read-only until the resulting diff is reviewed and approved.</p><label>Diagnosis<textarea value={diagnosis} onChange={(event) => setDiagnosis(event.target.value)} /></label><div className={styles.mappingGrid}><label>Relative target path<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="src/file.tsx" /></label><label className={styles.checkboxLabel}><input type="checkbox" checked={expectedAbsent} onChange={(event) => setExpectedAbsent(event.target.checked)} /> Create a new file (explicit absence required)</label></div><label>Exact old text anchor {expectedAbsent && <span className={styles.labelMuted}>must be empty</span>}<textarea className={styles.codeInput} value={oldText} onChange={(event) => setOldText(event.target.value)} placeholder={expectedAbsent ? "Leave empty for a new file" : "Paste one unique exact span from the current snapshot"} spellCheck={false} /></label><label>Proposed new text<textarea className={styles.codeInput} value={newText} onChange={(event) => setNewText(event.target.value)} placeholder="The reviewed replacement text" spellCheck={false} /></label><div className={styles.mappingGrid}><label>Behavior rationale<textarea value={behavior} onChange={(event) => setBehavior(event.target.value)} /></label><label>Suggested regression test<textarea value={tests} onChange={(event) => setTests(event.target.value)} /></label></div><div className={styles.modalActions}><button className={styles.secondaryButton} onClick={onClose}>Cancel</button><button className={styles.primaryButton} onClick={() => void submit()} disabled={submitting || !path || (!expectedAbsent && !oldText) || newText === ""}>{submitting ? "Checking anchors…" : "Create reviewed diff"}</button></div></ModalShell>;
 }
@@ -718,14 +780,14 @@ function ValidationDrawer({ candidates, runs, loading, error, suspended, onClose
 
 function UnselectedState({ hasRepository, onBind }: { hasRepository: boolean; onBind: () => void }) { return <div className={styles.unselected}><div className={styles.unselectedIcon}><Icon name="focus" /></div><h2>Choose a finding</h2><p>{hasRepository ? "The center pane will show scanner nodes beside current read-only source." : "Bind a repository to unlock current-code evidence. Report evidence remains visible without one."}</p>{!hasRepository && <button className={styles.secondaryButton} onClick={onBind}>Bind repository</button>}</div>; }
 
+function stateClass(state: string) { return styles[`match${state}`] ?? styles.matchunavailable; }
+function taskStateClass(state: TaskState) { return styles[`task${state}`] ?? styles.taskinvestigating; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : typeof error === "string" ? error : "CXView could not complete that operation."; }
 function emptyProvider(): ProviderDiagnostic { return { provider: "Codex CLI", installed: false, schemaOutputSupported: false, readOnlyFlagSupported: false, integrationEnabled: false, authentication: "Not checked", permissions: "Not checked", dataDestination: "No automatic outbound requests", diagnostic: "Provider diagnostic unavailable in browser preview." }; }
 function preventDefault(event: Event) { event.preventDefault(); }
 function shortPath(path: string) { const parts = path.replaceAll("\\", "/").split("/"); return parts.length > 3 ? `…/${parts.slice(-2).join("/")}` : path; }
 function capitalize(value: string) { return value.slice(0, 1).toUpperCase() + value.slice(1); }
 function severityClass(severity: string) { return `${styles[`severity${severity}`] ?? styles.severityUnknown}`; }
-function stateClass(state: string) { return styles[`match${state}`] ?? styles.matchUnavailable; }
-function taskStateClass(state: TaskState) { return styles[`task${state}`] ?? styles.taskInvestigating; }
 function readinessLabel(readiness: FindingSummary["evidenceReadiness"]) { return readiness === "ready" ? "evidence ready" : readiness === "partial" ? "partial evidence" : readiness === "ambiguous" ? "ambiguous" : "evidence missing"; }
 function viewLabel(value: string) { return value.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }
 function clearFilter(filter: string, setSeverity: (value: string) => void, setEngine: (value: string) => void, setStatus: (value: string) => void, setView: (value: string) => void) { if (filter.startsWith("severity:")) setSeverity(""); else if (filter.startsWith("engine:")) setEngine(""); else if (filter.startsWith("status:")) setStatus(""); else setView(""); }

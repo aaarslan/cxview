@@ -88,6 +88,7 @@ pub fn parse_report(
     let (format, adapter_id) = if let Some(object) = root.as_object() {
         let grouped_keys = ["scanResults", "scaScanResults", "iacScanResults"];
         if grouped_keys.iter().any(|key| object.contains_key(*key)) {
+            collect_root_declared_counts(object, &mut accumulator.declared_counts);
             for key in grouped_keys {
                 if let Some(value) = object.get(key) {
                     accumulator.sections.insert(key.to_owned());
@@ -119,6 +120,7 @@ pub fn parse_report(
             )
         } else if object.get("results").is_some() {
             accumulator.sections.insert("results".to_owned());
+            collect_root_declared_counts(object, &mut accumulator.declared_counts);
             collect_declared_counts(
                 object.get("results").unwrap_or(&Value::Null),
                 "/results",
@@ -668,6 +670,27 @@ fn collect_unknown_top_level(object: &Map<String, Value>, accumulator: &mut Pars
     }
 }
 
+/// Collects report-level totals such as `declaredTotal`. Only direct scalar members of the
+/// root object are read: descending into scanner branches here would treat a group or
+/// unsupported-branch total as a report-wide declaration.
+fn collect_root_declared_counts(object: &Map<String, Value>, result: &mut Vec<DeclaredCount>) {
+    for (key, value) in object {
+        let lower = key.to_ascii_lowercase();
+        if (lower == "count"
+            || lower == "total"
+            || lower.ends_with("count")
+            || lower.ends_with("total"))
+            && value.as_u64().is_some()
+        {
+            result.push(DeclaredCount {
+                label: key.clone(),
+                value: value.as_u64().unwrap_or_default() as usize,
+                locator: format!("/{key}"),
+            });
+        }
+    }
+}
+
 fn collect_declared_counts(
     value: &Value,
     locator: &str,
@@ -715,14 +738,19 @@ fn compare_declared_counts(
         .iter()
         .filter_map(|item| {
             let lower = item.label.to_ascii_lowercase();
-            let parsed = if lower.contains("sast") {
+            let parsed = if let Some(scoped) = section_scope(&item.locator, counts, total) {
+                // A total declared inside a scanner section describes that section's own
+                // query group. Comparing it against every parsed instance would report a
+                // mismatch that the report never claimed.
+                scoped
+            } else if lower.contains("sast") {
                 counts.sast
             } else if lower.contains("sca") {
                 counts.sca
             } else if lower.contains("iac") {
                 counts.iac
-            } else if lower == "count"
-                || lower == "total"
+            } else if lower.contains("count")
+                || lower.contains("total")
                 || lower.contains("finding")
                 || lower.contains("result")
             {
@@ -738,6 +766,16 @@ fn compare_declared_counts(
             })
         })
         .collect()
+}
+
+fn section_scope(locator: &str, counts: &ParsedCounts, total: usize) -> Option<usize> {
+    match locator.trim_start_matches('/').split('/').next() {
+        Some("scanResults") => Some(counts.sast),
+        Some("scaScanResults") => Some(counts.sca),
+        Some("iacScanResults") => Some(counts.iac),
+        Some("results") => Some(total),
+        _ => None,
+    }
 }
 
 fn extract_metadata(root: &Value, declared_counts: &[DeclaredCount]) -> ReportMetadata {
@@ -990,18 +1028,25 @@ fn masked_preview(value: &Value) -> String {
         let mut cursor = 0;
         while let Some(start) = text[cursor..].find(&needle) {
             let start = cursor + start + needle.len();
-            if let Some(end_rel) = text[start..].find('"') {
-                let end = start + end_rel;
-                text.replace_range(start..end, "[masked]");
-                cursor = end + 8;
-            } else {
+            let Some(end) = text[start..].find('"').map(|end| start + end) else {
                 break;
-            }
+            };
+            text.replace_range(start..end, "[masked]");
+            // The replacement is not the same length as the masked value, so the next
+            // search resumes from the end of the replacement rather than from an offset
+            // measured against the pre-replacement text.
+            cursor = start + "[masked]".len();
         }
     }
     if text.len() > 320 {
-        text.truncate(320);
-        text.push_str("…");
+        // The preview is capped by byte length, and the cut is moved back to the nearest
+        // character boundary so an untrusted multi-byte value cannot panic the truncation.
+        let mut end = 320;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
     }
     text
 }
@@ -1088,6 +1133,63 @@ mod tests {
             parsed.findings[2].summary.category,
             FindingCategory::Unknown
         );
+    }
+
+    #[test]
+    fn checked_in_grouped_fixture_reports_its_declared_total() {
+        let parsed = parse_report(
+            "grouped-cxone.json",
+            "fixtures/synthetic/grouped-cxone.json",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../fixtures/synthetic/grouped-cxone.json"
+            ))
+            .to_vec(),
+        )
+        .unwrap();
+        let declared_total = parsed
+            .report
+            .metadata
+            .declared_counts
+            .iter()
+            .find(|count| count.label == "declaredTotal")
+            .expect("the report-level declaredTotal is retained as evidence");
+        assert_eq!(declared_total.value, 99);
+        assert_eq!(declared_total.locator, "/declaredTotal");
+        // Only the report-level declaration disagrees with the parsed instances. Each section
+        // total matches its own section, so it is not reported as a mismatch.
+        assert_eq!(parsed.diagnostics.count_mismatches.len(), 1);
+        assert_eq!(parsed.diagnostics.count_mismatches[0].declared, 99);
+        assert_eq!(parsed.diagnostics.count_mismatches[0].parsed, 3);
+    }
+
+    #[test]
+    fn unsupported_previews_mask_adjacent_secrets_without_panicking() {
+        let parsed = parse_report(
+            "unsupported.json",
+            "/tmp/unsupported.json",
+            br#"{"scanResults":[],"futureBranch":[{"password":"abc","token":"short","clientSecret":"ghp_abcdefghijklmnop","note":"kept"}]}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(parsed.diagnostics.unsupported_records.len(), 1);
+        let preview = &parsed.diagnostics.unsupported_records[0].preview;
+        assert!(!preview.contains("abc"));
+        assert!(!preview.contains("short"));
+        assert!(!preview.contains("ghp_abcdefghijklmnop"));
+        assert!(preview.contains("kept"));
+    }
+
+    #[test]
+    fn long_previews_truncate_on_a_character_boundary() {
+        let report = format!(
+            r#"{{"scanResults":[],"futureBranch":[{{"note":"{}"}}]}}"#,
+            "日".repeat(200)
+        );
+        let parsed = parse_report("edge.json", "/tmp/edge.json", report.into_bytes()).unwrap();
+        let preview = &parsed.diagnostics.unsupported_records[0].preview;
+        assert!(preview.ends_with('…'));
+        assert!(preview.len() <= 320 + '…'.len_utf8());
     }
 
     #[test]

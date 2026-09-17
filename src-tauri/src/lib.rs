@@ -1,15 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod commands;
-mod comparison;
-mod db;
-mod error;
-mod importer;
-mod models;
-mod patching;
-mod provider;
-mod repository;
-mod validation;
+// The modules are public so the fixture walkthrough can be exercised end to end from
+// `src-tauri/tests/`; the renderer still reaches them only through the Tauri commands below.
+pub mod commands;
+pub mod comparison;
+pub mod db;
+pub mod error;
+pub mod importer;
+pub mod models;
+pub mod patching;
+pub mod provider;
+pub mod repository;
+pub mod validation;
 
 use std::fs;
 

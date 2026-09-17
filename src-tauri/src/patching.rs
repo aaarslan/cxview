@@ -52,6 +52,14 @@ pub fn capture_snapshot(
             repository_prefix,
             finding.reported_snippet.as_deref(),
         )?;
+        if matches!(resolved.state, MatchState::RelocatedWithEvidence) && !resolved.snippet_evidence
+        {
+            // A filename-only relocation is shown as evidence during investigation, but it does
+            // not authorize a snapshot or an edit. See `resolve_finding_path`.
+            return Err(AppError::Message(
+                "Cannot create an editable task: the reported path was relocated by a unique filename without matching snippet evidence. Bind the correct repository, or map the path explicitly.".to_owned(),
+            ));
+        }
         if let Some(absolute) = resolved.absolute {
             if let Some(relative) = absolute
                 .strip_prefix(&canonical_root)
@@ -203,7 +211,7 @@ pub fn build_patch(
                     "new-file precondition failed: {relative} already exists"
                 )));
             }
-            if edits.len() != 1 || edits[0].old_text != "" {
+            if edits.len() != 1 || !edits[0].old_text.is_empty() {
                 return Err(AppError::Unsupported(format!(
                     "new-file proposal for {relative} must contain exactly one empty old_text edit"
                 )));

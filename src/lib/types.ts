@@ -167,6 +167,7 @@ export interface Profile { id: string; name: string; repositoryPath?: string; re
 export interface FileManifest { path: string; sha256: string; byteLength: number; lineEnding: string; content?: string; expectedAbsent: boolean }
 export interface SnapshotManifest { taskId: string; reportId: string; repositoryPath: string; branch?: string; headCommit?: string; capturedAt: string; files: FileManifest[] }
 export interface TextEdit { path: string; oldText: string; newText: string; expectedAbsent: boolean }
+export interface ManualProposalInput { diagnosis: string; assumptions: string[]; edits: TextEdit[]; behaviorPreservation: string[]; suggestedTests: string[]; unresolvedQuestions: string[]; evidenceRefs: string[] }
 export interface ProposalDocument { schemaVersion: string; taskId: string; snapshotId: string; source: "manual" | "imported" | "offlineplaybook" | "codex"; provider?: string; diagnosis: string; assumptions: string[]; edits: TextEdit[]; behaviorPreservation: string[]; suggestedTests: string[]; unresolvedQuestions: string[]; evidenceRefs: string[] }
 export interface RemediationTask { id: string; profileId: string; reportId: string; findingIds: string[]; state: TaskState; createdAt: string; updatedAt: string; snapshot: SnapshotManifest; proposal?: ProposalDocument; diff?: string; patchId?: string; notes: string }
 export interface DiffFile { path: string; before: string; after: string }

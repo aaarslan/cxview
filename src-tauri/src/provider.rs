@@ -94,7 +94,7 @@ pub fn codex_proposal(
         source,
     })?;
     let prompt = format!(
-        "Read the task context from stdin and produce a contextual remediation proposal for task {}. The output must be a cxview-proposal-v1 JSON object with diagnosis, assumptions, exact text edits, behavior_preservation, suggested_tests, unresolved_questions, and evidence_refs. Do not claim tests passed. Do not write to the repository.\n\n{}",
+        "Read the task context from stdin and produce a contextual remediation proposal for task {}. The output must be a cxview-proposal-v1 JSON object with camelCase keys: diagnosis, assumptions, edits (each with path, oldText, newText, expectedAbsent), behaviorPreservation, suggestedTests, unresolvedQuestions, and evidenceRefs. Do not claim tests passed. Do not write to the repository.\n\n{}",
         task.id,
         serde_json::to_string(&context).unwrap_or_default()
     );
@@ -164,23 +164,80 @@ pub fn codex_proposal(
 }
 
 fn proposal_schema() -> serde_json::Value {
+    // The schema must match the camelCase wire contract that `ProposalDocument` deserializes:
+    // a schema-conformant provider response is rejected by serde if the two drift apart.
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "task_id", "snapshot_id", "source", "diagnosis", "assumptions", "edits", "behavior_preservation", "suggested_tests", "unresolved_questions", "evidence_refs"],
+        "required": ["schemaVersion", "taskId", "snapshotId", "source", "diagnosis", "assumptions", "edits", "behaviorPreservation", "suggestedTests", "unresolvedQuestions", "evidenceRefs"],
         "properties": {
-            "schema_version": {"const": "cxview-proposal-v1"},
-            "task_id": {"type": "string"},
-            "snapshot_id": {"type": "string"},
+            "schemaVersion": {"const": "cxview-proposal-v1"},
+            "taskId": {"type": "string"},
+            "snapshotId": {"type": "string"},
             "source": {"type": "string"},
             "provider": {"type": ["string", "null"]},
             "diagnosis": {"type": "string"},
             "assumptions": {"type": "array", "items": {"type": "string"}},
-            "edits": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["path", "old_text", "new_text", "expected_absent"], "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "expected_absent": {"type": "boolean"}}}},
-            "behavior_preservation": {"type": "array", "items": {"type": "string"}},
-            "suggested_tests": {"type": "array", "items": {"type": "string"}},
-            "unresolved_questions": {"type": "array", "items": {"type": "string"}},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}}
+            "edits": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["path", "oldText", "newText", "expectedAbsent"], "properties": {"path": {"type": "string"}, "oldText": {"type": "string"}, "newText": {"type": "string"}, "expectedAbsent": {"type": "boolean"}}}},
+            "behaviorPreservation": {"type": "array", "items": {"type": "string"}},
+            "suggestedTests": {"type": "array", "items": {"type": "string"}},
+            "unresolvedQuestions": {"type": "array", "items": {"type": "string"}},
+            "evidenceRefs": {"type": "array", "items": {"type": "string"}}
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_provider_schema_matches_the_proposal_wire_contract() {
+        let schema = proposal_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        let required = schema["required"].as_array().unwrap();
+        for key in required {
+            let key = key.as_str().unwrap();
+            assert!(
+                properties.contains_key(key),
+                "the required list names {key}, which the schema does not declare"
+            );
+            // A snake_case schema produces documents that serde rejects, because
+            // `ProposalDocument` deserializes camelCase keys.
+            assert!(
+                !key.contains('_'),
+                "{key} is not part of the camelCase contract"
+            );
+        }
+        let edit_properties = schema["properties"]["edits"]["items"]["properties"]
+            .as_object()
+            .unwrap();
+        for key in ["path", "oldText", "newText", "expectedAbsent"] {
+            assert!(
+                edit_properties.contains_key(key),
+                "edits must declare {key}"
+            );
+        }
+
+        // A document in the declared shape must deserialize into the model the adapter returns.
+        let document = json!({
+            "schemaVersion": "cxview-proposal-v1",
+            "taskId": "task-1",
+            "snapshotId": "task-1",
+            "source": "codex",
+            "provider": "Codex CLI test",
+            "diagnosis": "Test diagnosis.",
+            "assumptions": [],
+            "edits": [{"path": "src/App.tsx", "oldText": "before", "newText": "after", "expectedAbsent": false}],
+            "behaviorPreservation": ["visible text output is unchanged"],
+            "suggestedTests": ["npm test"],
+            "unresolvedQuestions": [],
+            "evidenceRefs": ["/scanResults/0/results/0"]
+        });
+        let parsed: ProposalDocument = serde_json::from_value(document).unwrap();
+        assert_eq!(parsed.schema_version, "cxview-proposal-v1");
+        assert_eq!(parsed.edits[0].old_text, "before");
+        assert_eq!(parsed.edits[0].new_text, "after");
+        assert!(matches!(parsed.source, ProposalSource::Codex));
+    }
 }

@@ -6,8 +6,7 @@
 
   <p>
     <a href="docs/WALKTHROUGH.md">Walk through the demo</a> ·
-    <a href="fixtures/README.md">Explore the fixtures</a> ·
-    <a href="CXView-PRD-and-Implementation-Handoff.md">Read the design brief</a>
+    <a href="fixtures/README.md">Explore the fixtures</a>
   </p>
 </div>
 
@@ -46,6 +45,8 @@ The renderer is intentionally calm and inspectable. The native Rust layer owns r
 - Git for repository metadata, reviewed patch application, and the Git-backed parts of the demo.
 - Optional: an installed `codex` CLI for proposal generation. CXView does not install it.
 
+The Tauri CLI is a `devDependencies` entry (`@tauri-apps/cli`), so `pnpm install` is the only setup step. A global `cargo install tauri-cli` is not required and is not used by the scripts here.
+
 ### Install and run
 
 ```sh
@@ -55,9 +56,9 @@ pnpm install
 pnpm tauri dev
 ```
 
-`pnpm dev` starts the browser preview. It is useful for UI work, but native file selection, repository inspection, SQLite state, Git patching, validation, and the provider adapter are intentionally unavailable there.
+`pnpm dev` starts the browser preview. It is useful for UI work, but native file selection, repository inspection, SQLite state, Git patching, validation, and the provider adapter are intentionally unavailable there, and every native action says so.
 
-If pnpm blocks the `esbuild` install script on a new machine, review and approve that specific dependency with `pnpm approve-builds --all`, then rerun the install.
+The `esbuild` install script is already allowed by `pnpm-workspace.yaml`. If pnpm blocks a build script for a new dependency, run `pnpm approve-builds` and review that specific package rather than approving the whole tree.
 
 For the full guided flow, follow [the walkthrough](docs/WALKTHROUGH.md). It uses only the checked-in synthetic fixtures and does not need Checkmarx credentials.
 
@@ -69,12 +70,12 @@ For the full guided flow, follow [the walkthrough](docs/WALKTHROUGH.md). It uses
 4. **Propose** — Start with the offline playbook, edit exact text anchors manually, import an external proposal, or use the optional proposal adapter.
 5. **Review** — CXView recomputes a real diff from the captured snapshot and shows touched files, rationale, and unresolved risks.
 6. **Apply** — A separate approval rechecks every base hash and applies without staging, committing, stashing, resetting, or cleaning.
-7. **Validate** — Checks come from the actual repository manifest. Each command needs a separate approval and is bounded by a 15-minute timeout.
+7. **Validate** — Checks come from the actual repository manifest inside the folder you bound. Each command needs a separate approval, is bounded by a 15-minute timeout, and retains at most 96 KiB of output while still recording the real exit status.
 8. **Compare** — Import a later report with visible provenance. A local pass and a scanner conclusion remain separate facts.
 
 ## Supported evidence
 
-The importer is deliberately explicit. These checked-in fixtures are synthetic because no production export was supplied with the implementation brief.
+The importer is deliberately explicit. The fixtures are synthetic because no production export was supplied with the implementation brief.
 
 | Input shape | Coverage | Fixture |
 | --- | --- | --- |
@@ -90,10 +91,10 @@ pnpm, Yarn, and Bun lockfiles are detected and disclosed, but their dependency g
 CXView is opinionated about where uncertainty and authority live:
 
 - **Evidence is labeled.** “Scanner claim”, “observed locally”, “user supplied”, and “AI hypothesis” are different things in the UI and data model.
-- **Source is read-only by default.** A proposal buffer is not a live-file editor. Exact old/new anchors, expected absence, file hashes, encoding, path containment, symlink/reparse ancestors, and Git state are checked natively.
+- **Source is read-only by default.** A proposal buffer is not a live-file editor. Exact old/new anchors, expected absence, file hashes, encoding, path containment, symlink/reparse ancestors, and Git state are checked natively. A finding whose file could only be relocated by filename, without a matching snippet, stays readable but cannot authorize an edit.
 - **Approval is narrow.** Reviewing a patch is not applying it. Applying a patch is not running a command. A passing command is not a scanner fix.
 - **Git stays recoverable.** CXView uses `git apply --check`, applies without staging or committing, records post-hashes, and only undoes its own guarded journal when subsequent edits have not invalidated it.
-- **Commands are disclosed.** Validation is discovered from the real manifest, shows executable/arguments/cwd plus network and write notes, removes known provider-token variables, and records bounded output.
+- **Commands are disclosed.** Validation is discovered from the real manifest — never from a parent directory above the folder you bound — shows executable/arguments/cwd plus network and write notes, removes known provider-token variables, and records bounded output.
 - **Providers are optional.** The Codex adapter is proposal-only, read-only, user initiated, and schema validated. The core import/investigation/review path makes no automatic network request.
 - **Data stays local.** Reports and task bundles can contain proprietary code, paths, or secrets. Storage is inspectable and deletable from the app; CXView does not claim encryption or forensic secure deletion.
 
@@ -137,10 +138,13 @@ There is intentionally no CI configuration, GitHub Actions workflow, pipeline, r
 pnpm test
 pnpm build
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri build
 ```
+
+`cargo test` runs the unit tests plus `src-tauri/tests/fixture_walkthrough.rs`, which replays the documented demo end to end against a disposable copy of the fixture: import, evidence, snapshot, exact-anchor proposal, Git preflight, apply, the repository's own check, and the guarded undo.
 
 `pnpm tauri build` writes local artifacts under `src-tauri/target/release/bundle/`. On the verified macOS ARM64 host, it produces:
 
@@ -171,4 +175,4 @@ CXView is not:
 - an automatic “fix every High” button, commit bot, PR bot, or deployment tool;
 - a cloud agent platform, repository-wide index, telemetry product, or bundled model runtime.
 
-The full design rationale and acceptance boundaries remain in [`CXView-PRD-and-Implementation-Handoff.md`](CXView-PRD-and-Implementation-Handoff.md). It is a design record, not a source of hidden runtime behavior or a substitute for the tests.
+The design record behind this implementation was supplied as a separate handoff document and is not part of this repository. What the product actually does is described by this README, by [`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md), and by the tests that run locally; nothing in the runtime depends on that document.
