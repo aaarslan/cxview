@@ -147,6 +147,17 @@ pub fn parse_report(
                 "CXone result-oriented report".to_owned(),
                 "cxone-results".to_owned(),
             )
+        } else if looks_like_summary_report(object) {
+            accumulator.sections.insert("summary".to_owned());
+            accumulator.unsupported.push(UnsupportedRecord {
+                locator: "/".to_owned(),
+                reason: "This project summary export contains aggregated counts but no machine-readable individual findings; it was retained as a summary-only import.".to_owned(),
+                preview: masked_preview(&root),
+            });
+            (
+                "Checkmarx project summary report".to_owned(),
+                "checkmarx-summary".to_owned(),
+            )
         } else {
             accumulator.sections.insert("unrecognized".to_owned());
             accumulator.unsupported.push(UnsupportedRecord { locator: "/".to_owned(), reason: "No supported scanResults/scaScanResults/iacScanResults or top-level results array was found.".to_owned(), preview: masked_preview(&root) });
@@ -637,6 +648,38 @@ fn collect_nodes_recursive(
     }
 }
 
+fn looks_like_summary_report(object: &Map<String, Value>) -> bool {
+    let has_summary = [
+        "reportType",
+        "header",
+        "projectsOverview",
+        "bySeverity",
+        "byState",
+        "byStatus",
+        "byScanner",
+        "languageOverview",
+        "resultsOverview",
+        "topTenVulnerabilityType",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+    let has_project_list = object
+        .get("projectsOverview")
+        .and_then(Value::as_object)
+        .and_then(|overview| overview.get("projectsList"))
+        .and_then(Value::as_array)
+        .is_some();
+    let has_summary_metrics = object
+        .get("bySeverity")
+        .and_then(Value::as_object)
+        .is_some()
+        || object
+            .get("resultsDistributionByStatus")
+            .and_then(Value::as_object)
+            .is_some();
+    has_summary || (has_project_list && has_summary_metrics)
+}
+
 fn collect_unknown_top_level(object: &Map<String, Value>, accumulator: &mut ParseAccumulator) {
     let known = [
         "scanResults",
@@ -781,16 +824,35 @@ fn section_scope(locator: &str, counts: &ParsedCounts, total: usize) -> Option<u
 fn extract_metadata(root: &Value, declared_counts: &[DeclaredCount]) -> ReportMetadata {
     let object = root.as_object();
     let get = |keys: &[&str]| object.and_then(|map| first_string(map, keys));
+    let project_details = object
+        .and_then(|map| map.get("projectsOverview"))
+        .and_then(Value::as_object)
+        .and_then(|overview| overview.get("projectsList"))
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(Value::as_object);
     let included_engines = object
         .map(|map| string_array(map, &["engines", "includedEngines", "scanners"]))
         .unwrap_or_default();
     ReportMetadata {
         project_id: get(&["projectId", "projectID"])
+            .or_else(|| project_details.and_then(|project| first_string(project, &["projectId", "projectID"])))
             .or_else(|| object.and_then(|map| map.get("project").and_then(as_string_from_value))),
         project_name: get(&["projectName"])
+            .or_else(|| project_details.and_then(|project| first_string(project, &["projectName", "name"])))
             .or_else(|| object.and_then(|map| map.get("project").and_then(as_name_from_value))),
         scan_id: get(&["scanId", "scanID", "id"]),
-        branch: get(&["branch", "branchName"]),
+        branch: get(&["branch", "branchName"]).or_else(|| {
+            project_details.and_then(|project| {
+                first_string(project, &["branch", "branchName"]).or_else(|| {
+                    project.get("projectBranchesOverview")
+                        .and_then(Value::as_array)
+                        .and_then(|branches| branches.first())
+                        .and_then(Value::as_object)
+                        .and_then(|branch| first_string(branch, &["branchName", "branch"]))
+                })
+            })
+        }),
         commit: get(&["commit", "commitId", "commitSha"]),
         timestamp: get(&["timestamp", "scanTimestamp", "createdAt", "date"]),
         included_engines,
@@ -1197,6 +1259,41 @@ mod tests {
         let parsed = parse_report("edge.json", "/tmp/edge.json", br#"{"scanResults":null,"scaScanResults":null,"iacScanResults":null,"metadata":{"status":"mystery"}}"#.to_vec()).unwrap();
         assert_eq!(parsed.findings.len(), 0);
         assert!(parsed.diagnostics.warnings.len() >= 3);
+    }
+
+    #[test]
+    fn checkmarx_summary_reports_are_accepted_without_findings() {
+        let parsed = parse_report(
+            "improved-project-report.json",
+            "/tmp/improved-project-report.json",
+            br#"{
+                "reportType": "Improved Project Report",
+                "header": {"tenantId": "4016c52f-1cd0-4307-99be-9713b71822b0", "timezone": "America/New_York"},
+                "projectsOverview": {
+                  "numberOfProjects": 1,
+                  "projectsList": [{
+                    "projectName": "deluxe-development/RaaS/raas-dashboardui",
+                    "projectId": "28de8627-fe3a-445d-854b-216ff695abc9",
+                    "severityDistribution": [{"level": "Critical", "value": 5}]
+                  }]
+                },
+                "bySeverity": {
+                  "totalResults": 18,
+                  "severitiesBreakdown": [{"level": "Critical", "value": 1, "percentage": 5.56}]
+                },
+                "byScanner": {
+                  "totalResults": 18,
+                  "scannersDistribution": [{"scannerName": "SCA", "numberOfResults": 18, "percentage": 100}]
+                }
+            }"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(parsed.findings.len(), 0);
+        assert_eq!(parsed.diagnostics.parsed_instances, 0);
+        assert_eq!(parsed.report.metadata.project_id.as_deref(), Some("28de8627-fe3a-445d-854b-216ff695abc9"));
+        assert_eq!(parsed.report.metadata.project_name.as_deref(), Some("deluxe-development/RaaS/raas-dashboardui"));
+        assert!(parsed.diagnostics.format.contains("summary"));
     }
 
     #[test]
