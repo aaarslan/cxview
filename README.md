@@ -53,7 +53,13 @@ The Tauri CLI is a `devDependencies` entry (`@tauri-apps/cli`), so `pnpm install
 git clone <your-fork-url>
 cd cxview
 pnpm install
-pnpm tauri dev
+pnpm tauri
+```
+
+### To build run
+
+```sh
+pnpm exec tauri build
 ```
 
 `pnpm dev` starts the browser preview. It is useful for UI work, but native file selection, repository inspection, SQLite state, Git patching, validation, and the provider adapter are intentionally unavailable there, and every native action says so.
